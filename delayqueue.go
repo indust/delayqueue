@@ -18,7 +18,7 @@ type DelayQueue struct {
 	// name for this Queue. Make sure the name is unique in redis database
 	name               string
 	redisCli           RedisCli
-	cb                 func(string) bool
+	cb                 CallbackWithIDFunc
 	pendingKey         string // sorted set: message id -> delivery time
 	readyKey           string // list
 	unAckKey           string // sorted set: message id -> retry time
@@ -71,6 +71,11 @@ type RedisCli interface {
 	ZScore(key string, member string) (float64, error)
 	LLen(key string) (int64, error)
 	LRem(key string, count int64, value string) (int64, error)
+	// ZScan represents redis command ZSCAN, returns members only (without scores) and the next cursor
+	ZScan(key string, cursor uint64, count int64) ([]string, uint64, error)
+	// GetMulti gets multiple keys which may belong to different cluster slots,
+	// returns existing keys only
+	GetMulti(keys []string) (map[string]string, error)
 
 	// Publish used for monitor only
 	Publish(channel string, payload string) error
@@ -97,6 +102,17 @@ type prefixOpt string
 // returns true to confirm successfully consumed, false to re-deliver this message
 type CallbackFunc = func(string) bool
 
+// CallbackWithIDFunc receives message id and payload, the id is the one returned by
+// SendScheduleMsgV2/SendDelayMsgV2, returns true to confirm successfully consumed
+type CallbackWithIDFunc = func(id string, payload string) bool
+
+func wrapCallback(callback CallbackFunc) CallbackWithIDFunc {
+	if callback == nil {
+		return nil
+	}
+	return func(_ string, payload string) bool { return callback(payload) }
+}
+
 // UseHashTagKey add hashtags to redis keys to ensure all keys of this queue are allocated in the same hash slot.
 // If you are using Codis/AliyunRedisCluster/TencentCloudRedisCluster, add this option to NewQueue
 // WARNING! Changing (add or remove) this option will cause DelayQueue failing to read existed data in redis
@@ -121,7 +137,7 @@ func NewQueue0(name string, cli RedisCli, opts ...interface{}) *DelayQueue {
 	}
 	prefix := "dp"
 	useHashTag := false
-	var callback CallbackFunc = nil
+	var callback CallbackWithIDFunc = nil
 	for _, opt := range opts {
 		switch o := opt.(type) {
 		case hashTagKeyOpt:
@@ -129,13 +145,15 @@ func NewQueue0(name string, cli RedisCli, opts ...interface{}) *DelayQueue {
 		case prefixOpt:
 			prefix = string(o)
 		case CallbackFunc:
+			callback = wrapCallback(o)
+		case CallbackWithIDFunc:
 			callback = o
 		}
 	}
 	keyPrefix := prefix + ":" + name
 	if useHashTag {
 		keyPrefix = "{" + keyPrefix + "}"
-	} 
+	}
 	return &DelayQueue{
 		name:               name,
 		redisCli:           cli,
@@ -163,7 +181,7 @@ func NewQueue0(name string, cli RedisCli, opts ...interface{}) *DelayQueue {
 // WithCallback set callback for queue to receives and consumes messages
 // callback returns true to confirm successfully consumed, false to re-deliver this message
 func (q *DelayQueue) WithCallback(callback CallbackFunc) *DelayQueue {
-	q.cb = callback
+	q.cb = wrapCallback(callback)
 	return q
 }
 
@@ -254,6 +272,12 @@ func (msg *MessageInfo) ID() string {
 	return msg.id
 }
 
+// NewMessageInfo rebuilds a MessageInfo from a persisted message id,
+// so that messages can be intercepted by another process or after restart.
+func NewMessageInfo(id string) *MessageInfo {
+	return &MessageInfo{id: id}
+}
+
 const (
 	StatePending    = "pending"
 	StateReady      = "ready"
@@ -266,19 +290,21 @@ const (
 func (q *DelayQueue) SendScheduleMsgV2(payload string, t time.Time, opts ...interface{}) (*MessageInfo, error) {
 	// parse options
 	retryCount := q.defaultRetryCount
+	ttl := q.msgTTL
 	for _, opt := range opts {
 		switch o := opt.(type) {
 		case retryCountOpt:
 			retryCount = uint(o)
 		case msgTTLOpt:
-			q.msgTTL = time.Duration(o)
+			// per-message option, must not mutate the shared queue config
+			ttl = time.Duration(o)
 		}
 	}
 	// generate id
 	idStr := uuid.Must(uuid.NewRandom()).String()
 	now := time.Now()
 	// store msg
-	msgTTL := t.Sub(now) + q.msgTTL // delivery + q.msgTTL
+	msgTTL := t.Sub(now) + ttl // delivery + ttl
 	err := q.redisCli.Set(q.genMsgKey(idStr), payload, msgTTL)
 	if err != nil {
 		return nil, fmt.Errorf("store msg failed: %v", err)
@@ -491,13 +517,16 @@ func (q *DelayQueue) retry2Unack() (string, error) {
 func (q *DelayQueue) callback(idStr string) error {
 	payload, err := q.redisCli.Get(q.genMsgKey(idStr))
 	if err == NilErr {
-		return nil
+		// payload expired or deleted: drop the message and release the fetch slot
+		return q.ack(idStr)
 	}
 	if err != nil {
-		// Is an IO error?
+		// Is an IO error? Keep it in unack so it is retried after maxConsumeDuration,
+		// but release the fetch slot, otherwise fetchLimit would eventually block consuming.
+		atomic.AddInt32(&q.fetchCount, -1)
 		return fmt.Errorf("get message payload failed: %v", err)
 	}
-	ack := q.cb(payload)
+	ack := q.cb(idStr, payload)
 	if ack {
 		err = q.ack(idStr)
 	} else {

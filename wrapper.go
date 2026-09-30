@@ -310,3 +310,60 @@ func NewQueueOnCluster(name string, cli *redis.ClusterClient,  opts ...interface
 	opts = append(opts, UseHashTagKey())
 	return NewQueue0(name, rc, opts...)
 }
+
+func zScanMembers(cli redis.Cmdable, key string, cursor uint64, count int64) ([]string, uint64, error) {
+	ctx := context.Background()
+	pairs, next, err := cli.ZScan(ctx, key, cursor, "", count).Result()
+	if err != nil {
+		return nil, 0, wrapErr(err)
+	}
+	// ZSCAN replies member, score, member, score...
+	members := make([]string, 0, len(pairs)/2)
+	for i := 0; i < len(pairs); i += 2 {
+		members = append(members, pairs[i])
+	}
+	return members, next, nil
+}
+
+// getMulti uses a pipeline instead of MGET, keys may be in different cluster slots
+func getMulti(cli redis.Cmdable, keys []string) (map[string]string, error) {
+	ctx := context.Background()
+	cmds := make([]*redis.StringCmd, len(keys))
+	_, err := cli.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+		for i, key := range keys {
+			cmds[i] = pipe.Get(ctx, key)
+		}
+		return nil
+	})
+	if err != nil && err != redis.Nil {
+		return nil, err
+	}
+	result := make(map[string]string, len(keys))
+	for i, cmd := range cmds {
+		value, err := cmd.Result()
+		if err == redis.Nil {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		result[keys[i]] = value
+	}
+	return result, nil
+}
+
+func (r *redisV9Wrapper) ZScan(key string, cursor uint64, count int64) ([]string, uint64, error) {
+	return zScanMembers(r.inner, key, cursor, count)
+}
+
+func (r *redisV9Wrapper) GetMulti(keys []string) (map[string]string, error) {
+	return getMulti(r.inner, keys)
+}
+
+func (r *redisClusterWrapper) ZScan(key string, cursor uint64, count int64) ([]string, uint64, error) {
+	return zScanMembers(r.inner, key, cursor, count)
+}
+
+func (r *redisClusterWrapper) GetMulti(keys []string) (map[string]string, error) {
+	return getMulti(r.inner, keys)
+}
